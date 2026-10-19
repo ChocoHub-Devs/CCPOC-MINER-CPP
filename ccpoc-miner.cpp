@@ -36,7 +36,6 @@
 #include <sstream>
 #include <iostream>
 #include <random>
-#include <future>
 #include <curl/curl.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
@@ -143,9 +142,8 @@ static inline void make_dirs(const std::string& path) {
 
 static const int SCOOP_SIZE = 32;
 static const int SCOOPS_PER_NONCE = 8192;
-static const int MINING_SCOOP_MODULUS = 4096;
-static const int HEADER_SIZE = 256;
-static const uint32_t PLOT_FORMAT_V3 = 3;
+static const int HEADER_SIZE = 512;
+static const uint32_t PLOT_FORMAT_V4 = 4;
 static const std::string ZERO_HASH(64, '0');
 static const double EFFECTIVE_CAPACITY_CAP_GB = 10 * 1024;
 static const int SCAN_CHUNK_TARGET_BYTES = 32 * 1024 * 1024;
@@ -158,7 +156,9 @@ static const char* RED = "\033[91m";
 static const char* BOLD = "\033[1m";
 static const char* MAGENTA = "\033[95m";
 
+static std::string g_wallet_path_override;
 static std::string wallet_path() {
+    if (!g_wallet_path_override.empty()) return g_wallet_path_override;
     const char* env = getenv("HOME");
     std::string base = env ? env : ".";
     return base + "/wallet.json";
@@ -227,7 +227,6 @@ typedef struct stat PlotStat;
 static inline int fseek64(FILE* f, long long off, int whence) { return fseeko(f, (off_t)off, whence); }
 #endif
 static long long file_size(const std::string& p) { PlotStat st; return plot_stat(p.c_str(), &st) == 0 ? (long long)st.st_size : -1; }
-static double now_sec() { return (double)clock_gettime(CLOCK_MONOTONIC, nullptr) == 0 ? 0 : 0; }
 static double mono_sec() {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
@@ -470,10 +469,6 @@ static bool json_parse(const std::string& s, Json& out) {
     return true;
 }
 
-static std::string json_sorted_dump(const Json& j) {
-    return j.dump();
-}
-
 struct Sha256 {
     uint32_t h[8];
     uint64_t len_bytes;
@@ -545,11 +540,135 @@ struct Sha256 {
     }
 };
 static void sha256(const uint8_t* d, size_t n, uint8_t out[32]) { Sha256 c; c.update(d, n); c.final(out); }
-static void sha256(const std::string& s, uint8_t out[32]) { sha256((const uint8_t*)s.data(), s.size(), out); }
 static void sha256(const std::vector<uint8_t>& v, uint8_t out[32]) { sha256(v.data(), v.size(), out); }
-static std::string sha256hex(const uint8_t* d, size_t n) { uint8_t o[32]; sha256(d, n, o); return hex_encode(o, 32); }
-static std::string sha256hex(const std::string& s) { return sha256hex((const uint8_t*)s.data(), s.size()); }
-static std::string sha256hexbuf(const std::vector<uint8_t>& v) { return sha256hex(v.data(), v.size()); }
+
+static void put_be32(uint8_t* out, uint32_t v) {
+    out[0] = (uint8_t)(v >> 24); out[1] = (uint8_t)(v >> 16);
+    out[2] = (uint8_t)(v >> 8); out[3] = (uint8_t)v;
+}
+static void put_be64(uint8_t* out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out[i] = (uint8_t)(v >> (56 - 8 * i));
+}
+static uint32_t get_le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t get_le64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) v = (v << 8) | p[i];
+    return v;
+}
+static void put_le32(uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (8 * i));
+}
+static void put_le64(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static bool canonical_seed(const std::string& chain_id, const std::string& miner,
+                           const std::string& plot_id, uint64_t nonce_index, uint8_t seed[32]) {
+    if (chain_id.empty() || (chain_id.size() > 1 && chain_id[0] == '0')) return false;
+    for (char c : chain_id) if (c < '0' || c > '9') return false;
+    if (chain_id.size() > 255) return false;
+    std::vector<uint8_t> address, id;
+    if (!hex_decode(miner, address) || address.size() != 20 ||
+        !hex_decode(plot_id, id) || id.size() != 32) return false;
+
+    uint8_t nonce[8];
+    put_be64(nonce, nonce_index);
+    std::vector<uint8_t> seed_data;
+    static const char nonce_domain[] = "CCPOC:PLOT:V4:NONCE\0";
+    seed_data.insert(seed_data.end(), nonce_domain, nonce_domain + sizeof(nonce_domain) - 1);
+    seed_data.push_back((uint8_t)chain_id.size());
+    seed_data.insert(seed_data.end(), chain_id.begin(), chain_id.end());
+    seed_data.insert(seed_data.end(), address.begin(), address.end());
+    seed_data.insert(seed_data.end(), id.begin(), id.end());
+    seed_data.insert(seed_data.end(), nonce, nonce + sizeof(nonce));
+    sha256(seed_data, seed);
+    return true;
+}
+
+static void canonical_leaf_next(const uint8_t seed[32], uint16_t slot,
+                               const uint8_t previous[32], uint8_t out[32]) {
+    static const char leaf_domain[] = "CCPOC:PLOT:V4:LEAF\0";
+    std::vector<uint8_t> input;
+    input.reserve(sizeof(leaf_domain) - 1 + 32 + 2 + 32);
+    input.insert(input.end(), leaf_domain, leaf_domain + sizeof(leaf_domain) - 1);
+    input.insert(input.end(), seed, seed + 32);
+    uint8_t slot_bytes[2] = { (uint8_t)(slot >> 8), (uint8_t)slot };
+    input.insert(input.end(), slot_bytes, slot_bytes + sizeof(slot_bytes));
+    input.insert(input.end(), previous, previous + 32);
+    sha256(input, out);
+}
+
+static void canonical_leaf_for_slot(const uint8_t seed[32], uint16_t slot, uint8_t out[32]) {
+    static const char leaf_domain[] = "CCPOC:PLOT:V4:LEAF\0";
+    uint8_t slot_bytes[2] = { 0, 0 };
+    std::vector<uint8_t> input;
+    input.reserve(sizeof(leaf_domain) - 1 + 32 + 2);
+    input.insert(input.end(), leaf_domain, leaf_domain + sizeof(leaf_domain) - 1);
+    input.insert(input.end(), seed, seed + 32);
+    input.insert(input.end(), slot_bytes, slot_bytes + sizeof(slot_bytes));
+    sha256(input, out);
+    for (uint16_t s = 1; s <= slot; ++s) {
+        uint8_t next[32];
+        canonical_leaf_next(seed, s, out, next);
+        memcpy(out, next, sizeof(next));
+    }
+}
+
+static bool canonical_leaf(const std::string& chain_id, const std::string& miner,
+                           const std::string& plot_id, uint64_t index, uint8_t out[32]) {
+    uint8_t seed[32];
+    if (!canonical_seed(chain_id, miner, plot_id, index / SCOOPS_PER_NONCE, seed)) return false;
+    canonical_leaf_for_slot(seed, (uint16_t)(index % SCOOPS_PER_NONCE), out);
+    return true;
+}
+
+static bool v4_challenge_slot(const std::string& challenge_id, uint32_t& slot) {
+    std::vector<uint8_t> id;
+    if (!hex_decode(challenge_id, id) || id.size() != 32) return false;
+    static const char domain[] = "CCPOC:CHALLENGE:V4\0";
+    std::vector<uint8_t> input(domain, domain + sizeof(domain) - 1);
+    input.insert(input.end(), id.begin(), id.end());
+    uint8_t digest[32];
+    sha256(input, digest);
+    slot = (((uint32_t)digest[30] << 8) | digest[31]) & (SCOOPS_PER_NONCE - 1);
+    return true;
+}
+
+static bool v4_sample_indexes(const std::string& challenge_id, uint64_t total_leaves,
+                              const std::string& plot_id, std::vector<uint64_t>& out,
+                              uint64_t excluded) {
+    out.clear();
+    std::vector<uint8_t> challenge, id;
+    if (!hex_decode(challenge_id, challenge) || challenge.size() != 32 ||
+        !hex_decode(plot_id, id) || id.size() != 32 || total_leaves == 0) return false;
+    static const char domain[] = "CCPOC:SAMPLE:V4\0";
+    uint8_t total[8], round[4] = {0, 0, 0, 4};
+    put_be64(total, total_leaves);
+    std::set<uint64_t> seen{excluded};
+    // Mirror the node bound in deriveCapacitySampleIndexes, which throws when
+    // counter > count*1024 + excluded.size*1024 + 1024 (count=16, excluded=1 -> 18432).
+    const uint32_t work_bound = 16u * 1024u + 1024u + 1024u;
+    for (uint32_t counter = 0; out.size() < 16 && counter <= work_bound; ++counter) {
+        uint8_t cb[4]; put_be32(cb, counter);
+        std::vector<uint8_t> input(domain, domain + sizeof(domain) - 1);
+        input.insert(input.end(), challenge.begin(), challenge.end());
+        input.insert(input.end(), id.begin(), id.end());
+        input.insert(input.end(), total, total + sizeof(total));
+        input.insert(input.end(), round, round + sizeof(round));
+        input.insert(input.end(), cb, cb + sizeof(cb));
+        uint8_t digest[32]; sha256(input, digest);
+        uint64_t value = 0;
+        for (int i = 0; i < 8; ++i) value = (value << 8) | digest[i];
+        // Node uses a 2^64 rejection bound before modulo. UINT64_MAX cannot represent 2^64.
+        const uint64_t remainder = (uint64_t)(0 - total_leaves) % total_leaves;
+        if (remainder && value > UINT64_MAX - remainder) continue;
+        uint64_t index = value % total_leaves;
+        if (seen.insert(index).second) out.push_back(index);
+    }
+    return out.size() == 16;
+}
 
 static inline uint64_t rotl64(uint64_t x, int n) { if (n == 0) return x; return (x << n) | (x >> (64 - n)); }
 static void keccak_f1600(uint64_t st[25]) {
@@ -656,7 +775,16 @@ static void log_win(const std::string& m) { log_line(GREEN, "WIN", m); }
 
 static void notify(const std::string& title, const std::string& body) {
     if (system("command -v termux-notification >/dev/null 2>&1") != 0) return;
-    std::string cmd = "termux-notification --title '" + title + "' --content '" + body + "' --id choco-miner >/dev/null 2>&1 &";
+    auto shell_quote = [](const std::string& value) {
+        std::string quoted = "'";
+        for (char c : value) {
+            if (c == '\'') quoted += "'\\''";
+            else quoted += c;
+        }
+        quoted += "'";
+        return quoted;
+    };
+    std::string cmd = "termux-notification --title " + shell_quote(title) + " --content " + shell_quote(body) + " --id choco-miner >/dev/null 2>&1 &";
     (void)system(cmd.c_str());
 }
 
@@ -685,7 +813,6 @@ struct Wallet {
 };
 
 using BNPtr = std::unique_ptr<BIGNUM, decltype(&BN_free)>;
-using ECPtr = std::unique_ptr<EC_KEY, decltype(&EC_KEY_free)>;
 
 static std::string derive_address_from_pubbytes(const std::vector<uint8_t>& pub) {
     if (pub.size() == 64) {
@@ -717,6 +844,10 @@ static Wallet load_wallet_file(const std::string& path) {
     Wallet w;
     std::ifstream f(path);
     if (!f) return w;
+    f.seekg(0, std::ios::end);
+    const std::streamoff size = f.tellg();
+    if (size <= 0 || size > 64 * 1024) return w;
+    f.seekg(0, std::ios::beg);
     std::stringstream ss;
     ss << f.rdbuf();
     Json j;
@@ -844,33 +975,10 @@ static std::string proof_message(const std::string& challenge_id, const std::str
     return d.dump();
 }
 
-static std::string plot_register_message(const std::string& miner, const std::string& plot_id,
-                                         const std::string& merkle_root, const std::string& size_gb,
-                                         long long total_scoops) {
-    Json d = Json::object();
-    d.obj["merkle_root"] = Json::s(merkle_root);
-    d.obj["miner"] = Json::s(str_tolower(miner));
-    d.obj["plot_id"] = Json::s(plot_id);
-    d.obj["size_gb"] = Json::s(size_gb);
-    d.obj["total_scoops"] = Json::s(std::to_string(total_scoops));
-    d.obj["type"] = Json::s("plot_register");
-    return d.dump();
-}
-
-static std::vector<uint8_t> compute_account_id(const std::string& pubkey_hex) {
-    std::vector<uint8_t> pk;
-    hex_decode(pubkey_hex, pk);
-    uint8_t d[32] = {0};
-    if (!pk.empty()) sha256(pk.data(), pk.size(), d);
-    return std::vector<uint8_t>(d, d + 32);
-}
-
 static std::string g_user_agent = [] {
     const char* e = getenv("USER_AGENT");
     return e ? e : "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 }();
-static std::vector<std::string> g_seed_urls = { "https://seed2.chocohub.org" };
-
 struct HttpResp {
     long code = 0;
     std::string body;
@@ -879,12 +987,16 @@ struct HttpResp {
 
 static size_t curl_write_cb(char* p, size_t sz, size_t n, void* ud) {
     auto* s = (std::string*)ud;
-    s->append(p, sz * n);
-    return sz * n;
+    constexpr size_t MAX_HTTP_BODY = 8 * 1024 * 1024;
+    if (sz != 0 && n > (MAX_HTTP_BODY - std::min(MAX_HTTP_BODY, s->size())) / sz) return 0;
+    const size_t bytes = sz * n;
+    if (s->size() + bytes > MAX_HTTP_BODY) return 0;
+    s->append(p, bytes);
+    return bytes;
 }
 
 static HttpResp http_raw(const std::string& method, const std::string& url, const std::string& body,
-                         int timeout, bool verify_ssl) {
+                         int timeout, bool /*verify_ssl*/) {
     HttpResp r;
     CURL* c = curl_easy_init();
     if (!c) return r;
@@ -896,16 +1008,14 @@ static HttpResp http_raw(const std::string& method, const std::string& url, cons
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
     struct curl_slist* hdr = nullptr;
     if (!body.empty()) {
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.data());
         curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
         hdr = curl_slist_append(hdr, "Content-Type: application/json");
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
-    }
-    if (!verify_ssl) {
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
     }
     CURLcode rc = curl_easy_perform(c);
     if (rc == CURLE_OK) {
@@ -973,9 +1083,33 @@ static bool fetch_block(const std::string& base, long long height, bool verify_s
     return false;
 }
 
+static bool fetch_mature_plot_roots(const std::string& base, const std::string& miner,
+                                    bool verify_ssl, std::map<std::string, std::string>& roots) {
+    roots.clear();
+    Json response;
+    if (!http_get(base + "/api/poc/plots/" + str_tolower(miner), response, 5, 1, verify_ssl)) return false;
+    const Json* plots = response.get("plots");
+    if (!plots || !plots->is_arr()) return false;
+    for (const auto& plot : plots->arr) {
+        const Json* id = plot.get("plot_id");
+        const Json* root = plot.get("merkle_root");
+        if (!id || !root) continue;
+        std::string plot_id = str_tolower(id->as_str());
+        std::string merkle_root = str_tolower(root->as_str());
+        if (plot_id.size() == 64 && merkle_root.size() == 64) roots[plot_id] = merkle_root;
+    }
+    return true;
+}
+
 static long long plot_scoop_count(double size_gb) {
-    double s = size_gb * 1024.0 * 1024 * 1024 / SCOOP_SIZE;
-    return std::max<long long>(1, (long long)s);
+    if (!std::isfinite(size_gb) || size_gb <= 0) return 0;
+    const long double bytes = (long double)size_gb * 1024.0L * 1024.0L * 1024.0L;
+    if (bytes > (long double)10 * 1024 * 1024 * 1024 * 1024) return 0;
+    const long double leaves = bytes / SCOOP_SIZE;
+    const long double rounded = std::round(leaves);
+    if (std::fabs(leaves - rounded) > 0.000001L || rounded < SCOOPS_PER_NONCE ||
+        std::fmod(rounded, SCOOPS_PER_NONCE) != 0) return 0;
+    return (long long)rounded;
 }
 static long long merkle_tree_internal_node_count(long long n) {
     long long total = 0;
@@ -1014,7 +1148,7 @@ static double compute_effective_capacity_gb(double size_gb) {
     return total * mult;
 }
 static long long compute_deadline(const uint8_t* scoop, size_t scoop_len,
-                                  const std::vector<uint8_t>& sig, long long bt, long long max_dl = 86400) {
+                                  const std::vector<uint8_t>& sig, long long bt) {
     Sha256 c;
     c.update(scoop, scoop_len);
     if (!sig.empty()) c.update(sig.data(), sig.size());
@@ -1023,86 +1157,50 @@ static long long compute_deadline(const uint8_t* scoop, size_t scoop_len,
     uint64_t q = 0;
     for (int i = 0; i < 8; i++) q = (q << 8) | d[i];
     long long dl = (long long)(q / (uint64_t)std::max(1LL, bt));
-    return std::max(1LL, std::min(dl, max_dl));
-}
-
-static void generate_v3_scoops(const uint8_t* account_id, uint32_t nonce, uint32_t count, uint8_t* out) {
-    std::vector<uint8_t> seed(account_id, account_id + 32);
-    uint8_t nb[4] = { (uint8_t)nonce, (uint8_t)(nonce >> 8), (uint8_t)(nonce >> 16), (uint8_t)(nonce >> 24) };
-    seed.insert(seed.end(), nb, nb + 4);
-    uint8_t base[32];
-    sha256(seed.data(), seed.size(), base);
-    std::vector<uint8_t> buf(36);
-    memcpy(buf.data(), base, 32);
-    for (uint32_t i = 0; i < count; i++) {
-        buf[32] = (uint8_t)i; buf[33] = (uint8_t)(i >> 8); buf[34] = (uint8_t)(i >> 16); buf[35] = (uint8_t)(i >> 24);
-        sha256(buf.data(), 36, out + (size_t)i * 32);
-    }
+    return std::max(1LL, std::min(dl, 86400LL));
 }
 
 struct PlotMeta {
     std::string path;
-    uint32_t total_scoops = 0;
+    uint64_t total_scoops = 0;
     std::string plot_id;
     std::string merkle_root;
     uint32_t version = 0;
     uint32_t scoop_size = 32;
-    std::string account_id;
-    uint64_t first_nonce = 0;
-    time_t mtime = 0;
+    std::string miner;
+    std::string chain_id;
     bool valid = false;
 };
-static std::map<std::string, PlotMeta> g_plot_cache;
 
 static PlotMeta get_plot_meta(const std::string& path) {
     PlotStat st;
     if (plot_stat(path.c_str(), &st) != 0) return PlotMeta{};
-    auto it = g_plot_cache.find(path);
-    if (it != g_plot_cache.end() && it->second.mtime == st.st_mtime) return it->second;
     PlotMeta m;
     m.path = path;
-    m.mtime = st.st_mtime;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return m;
     uint8_t hdr[HEADER_SIZE] = {0};
     size_t got = fread(hdr, 1, HEADER_SIZE, f);
     fclose(f);
-    if (got < 136 || memcmp(hdr, "CHOCOHUB", 8) != 0) return m;
-    m.version = *(uint32_t*)(hdr + 8);
-    m.total_scoops = *(uint32_t*)(hdr + 64);
-    m.scoop_size = *(uint32_t*)(hdr + 68);
-    if (m.total_scoops < 1) return m;
+    if (got != HEADER_SIZE || memcmp(hdr, "CCPOC4PL", 8) != 0) return m;
+    m.version = get_le32(hdr + 8);
+    m.scoop_size = get_le32(hdr + 12);
+    m.total_scoops = get_le64(hdr + 16);
+    m.plot_id = hex_encode(hdr + 32, 32);
+    m.miner = "0x" + hex_encode(hdr + 64, 20);
+    m.merkle_root = hex_encode(hdr + 84, 32);
+    const uint8_t chain_len = hdr[116];
+    if (chain_len == 0) return m;
+    m.chain_id.assign((const char*)hdr + 120, chain_len);
+    if (m.version != PLOT_FORMAT_V4 || m.scoop_size != SCOOP_SIZE ||
+        m.total_scoops < SCOOPS_PER_NONCE || m.total_scoops % SCOOPS_PER_NONCE != 0 ||
+        m.total_scoops > (uint64_t)(10LL * 1024 * 1024 * 1024 * 1024 / SCOOP_SIZE)) return m;
     long long expected = plot_total_size(m.total_scoops);
     if (st.st_size != expected) { log_error("Plot " + path + " size mismatch"); return PlotMeta{}; }
-    uint32_t id_high = *(uint32_t*)(hdr + 12);
-    uint32_t id_low = *(uint32_t*)(hdr + 16);
-    char buf[17];
-    snprintf(buf, sizeof buf, "%08x%08x", id_high, id_low);
-    m.plot_id = buf;
-    m.merkle_root = hex_encode(hdr + 72, 32);
-    if (m.version == 3 && got >= 136) m.account_id = hex_encode(hdr + 104, 32);
-    if (m.version == 3 && got >= 144) m.first_nonce = *(uint64_t*)(hdr + 136);
+    if (m.plot_id == std::string(64, '0') || m.merkle_root == ZERO_HASH) return PlotMeta{};
     m.valid = true;
-    g_plot_cache[path] = m;
     return m;
 }
-
-static std::string checkpoint_path(const std::string& p) { return p + ".plot_checkpoint"; }
-static void save_checkpoint(const std::string& plot, const char* stage, long long scoop, int level) {
-    FILE* f = fopen(checkpoint_path(plot).c_str(), "w");
-    if (f) { fprintf(f, "%s\n%lld\n%d\n", stage, scoop, level); fclose(f); }
-}
-struct Checkpoint { std::string stage; long long scoop = 0; int level = 0; };
-static bool load_checkpoint(const std::string& plot, Checkpoint& cp) {
-    FILE* f = fopen(checkpoint_path(plot).c_str(), "r");
-    if (!f) return false;
-    char st[32];
-    if (fscanf(f, "%31s %lld %d", st, &cp.scoop, &cp.level) < 2) { fclose(f); return false; }
-    cp.stage = st;
-    fclose(f);
-    return true;
-}
-static void clear_checkpoint(const std::string& plot) { unlink(checkpoint_path(plot).c_str()); }
 
 static bool check_disk_space(const std::string& plot_path, double required) {
     std::string dir = plot_path;
@@ -1168,44 +1266,34 @@ static std::string random_hex(size_t n) {
     return hex_encode(b.data(), n);
 }
 
-static uint64_t scan_used_nonce_ranges(const std::string& dir, const std::string& account_id_hex) {
-    uint64_t highest = 0;
-    DIR* d = opendir(dir.empty() ? "." : dir.c_str());
-    if (!d) return 0;
-    struct dirent* e;
-    while ((e = readdir(d))) {
-        std::string name = e->d_name;
-        if (name.size() < 5 || name.substr(name.size() - 5) != ".plot") continue;
-        PlotMeta m = get_plot_meta(dir + "/" + name);
-        if (!m.valid) continue;
-        if (!account_id_hex.empty() && !m.account_id.empty() && m.account_id != account_id_hex) continue;
-        uint64_t nonces = (m.total_scoops + SCOOPS_PER_NONCE - 1) / SCOOPS_PER_NONCE;
-        highest = std::max(highest, m.first_nonce + nonces);
-    }
-    closedir(d);
-    return highest;
-}
-
 struct PlotResult {
     std::string plot_id;
     double size_gb = 0;
     long long total_scoops = 0;
     std::string merkle_root;
-    std::string account_id;
     bool ok = false;
     std::string path;
 };
 
-static void cp_merkle_parallel_pass(const std::string& in_path, const std::string& out_path,
+struct PlotTempCleanup {
+    std::vector<std::string> paths;
+    ~PlotTempCleanup() {
+        for (const auto& path : paths) if (!path.empty()) unlink(path.c_str());
+    }
+};
+
+static bool cp_merkle_parallel_pass(const std::string& in_path, const std::string& out_path,
                                     long long count, int workers) {
     long long new_len = (count + 1) / 2;
     FILE* in = fopen(in_path.c_str(), "rb");
     FILE* out = fopen(out_path.c_str(), "wb");
-    if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return; }
+    if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return false; }
     const long long CHUNK = 256 * 1024;
     std::atomic<long long> next{0};
     std::map<long long, std::vector<uint8_t>> results;
     std::mutex res_mu;
+    std::mutex input_mu;
+    std::atomic<bool> read_failed{false};
     long long total_chunks = (new_len + CHUNK - 1) / CHUNK;
     auto worker = [&]() {
         while (true) {
@@ -1216,13 +1304,17 @@ static void cp_merkle_parallel_pass(const std::string& in_path, const std::strin
             std::vector<uint8_t> raw(cnt * 64);
             std::vector<uint8_t> outb(cnt * 32);
             {
-                fseek64(in, start * 64, SEEK_SET);
-                size_t got = fread(raw.data(), 1, cnt * 64, in);
-                if (got < cnt * 64) {
-                    uint8_t tail[32] = {0};
-                    if (got >= 32) memcpy(tail, raw.data() + got - 32, 32);
-                    for (size_t k = got / 32 * 32; k < cnt * 64; k += 32)
-                        memcpy(raw.data() + k, tail, 32);
+                std::lock_guard<std::mutex> input_lock(input_mu);
+                const long long first_leaf = start * 2;
+                const long long leaves_to_read = std::min(cnt * 2, count - first_leaf);
+                const size_t bytes_to_read = (size_t)leaves_to_read * 32;
+                if (fseek64(in, first_leaf * 32, SEEK_SET) != 0 || fread(raw.data(), 1, bytes_to_read, in) != bytes_to_read) {
+                    read_failed.store(true);
+                    break;
+                }
+                if (leaves_to_read < cnt * 2) {
+                    memcpy(raw.data() + (size_t)leaves_to_read * 32,
+                           raw.data() + (size_t)(leaves_to_read - 1) * 32, 32);
                 }
             }
             for (long long i = 0; i < cnt; i++)
@@ -1234,26 +1326,37 @@ static void cp_merkle_parallel_pass(const std::string& in_path, const std::strin
     std::vector<std::thread> ths;
     for (int i = 0; i < workers; i++) ths.emplace_back(worker);
     for (auto& t : ths) t.join();
-    for (long long ci = 0; ci < total_chunks; ci++)
-        fwrite(results[ci].data(), 1, results[ci].size(), out);
-    fclose(in);
-    fclose(out);
+    bool write_ok = !read_failed.load();
+    for (long long ci = 0; ci < total_chunks && write_ok; ci++) {
+        auto it = results.find(ci);
+        if (it == results.end() || fwrite(it->second.data(), 1, it->second.size(), out) != it->second.size()) write_ok = false;
+    }
+    if (ferror(in) || ferror(out)) write_ok = false;
+    if (fclose(in) != 0) write_ok = false;
+    if (fflush(out) != 0 || ferror(out)) write_ok = false;
+    if (fclose(out) != 0) write_ok = false;
+    return write_ok;
 }
 
 
 static PlotResult create_plot_file(const std::string& plot_path, const std::string& plot_id,
-                                   const std::string& miner_address, double size_gb,
-                                   const std::vector<uint8_t>& account_id,
-                                   bool progress, bool resume, uint64_t first_nonce_in) {
+                                   const std::string& miner_address, const std::string& chain_id,
+                                   double size_gb, bool progress) {
     PlotResult res;
     long long total_scoops = plot_scoop_count(size_gb);
-    if (total_scoops < 1) { log_error("Invalid size"); return res; }
-    if (total_scoops > 0xFFFFFFFFLL) {
-        double max_gb = (double)0xFFFFFFFF * SCOOP_SIZE / (1024.0*1024*1024);
-        char b[128]; snprintf(b, sizeof b, "Plot size too large for v3 format: max ~%.1f GB", max_gb);
-        log_error(b);
+    if (total_scoops < SCOOPS_PER_NONCE) {
+        log_error("v4 plot capacity must be an exact multiple of 256 KiB, from 256 KiB through 10 TiB");
         return res;
     }
+    std::vector<uint8_t> address, plot_id_bytes;
+    if (!hex_decode(miner_address, address) || address.size() != 20 ||
+        !hex_decode(plot_id, plot_id_bytes) || plot_id_bytes.size() != 32 ||
+        chain_id.empty() || chain_id.size() > 255) {
+        log_error("Invalid v4 chain ID, miner address, or 32-byte plot ID");
+        return res;
+    }
+    for (char c : chain_id) if (c < '0' || c > '9') { log_error("chain_id must be canonical unsigned decimal"); return res; }
+    if (chain_id.size() > 1 && chain_id[0] == '0') { log_error("chain_id must be canonical unsigned decimal"); return res; }
     std::string dir = plot_path;
     auto sl = dir.find_last_of('/');
     if (sl != std::string::npos) {
@@ -1261,33 +1364,18 @@ static PlotResult create_plot_file(const std::string& plot_path, const std::stri
         make_dirs(d);
     }
     long long plot_size = plot_total_size(total_scoops);
+    if (file_exists(plot_path)) {
+        log_error("Refusing to overwrite existing plot: " + plot_path);
+        return res;
+    }
     if (!check_disk_space(plot_path, plot_size * 1.3)) return res;
 
-    std::vector<uint8_t> acct = account_id;
-    if (acct.empty()) acct = g_random_bytes(32);
-    std::string acct_hex = hex_encode(acct.data(), 32);
-
-    uint64_t first_nonce = first_nonce_in;
-    if (first_nonce == (uint64_t)-1) {
-        uint64_t needed = (total_scoops + SCOOPS_PER_NONCE - 1) / SCOOPS_PER_NONCE;
-        std::mt19937_64 rng(std::random_device{}());
-        first_nonce = rng() % 0x100000000ULL;
-        if (first_nonce > (uint64_t)0x100000000 - needed - 1)
-            first_nonce = scan_used_nonce_ranges(sl != std::string::npos ? dir.substr(0, sl) : ".", acct_hex);
-    }
-
-    log_info("Plot ID: " + plot_id + ", Miner: " + miner_address + ", Account: " + acct_hex.substr(0,16) +
-             "..., first_nonce=" + std::to_string(first_nonce));
+    log_info("Plot ID: " + plot_id + ", Miner: " + miner_address + ", chain_id=" + chain_id);
     {
         char b[128];
         snprintf(b, sizeof b, "Total scoops: %lld, File size: %.2f GB", total_scoops, plot_size/1e9);
         log_info(b);
     }
-
-    Checkpoint cp;
-    bool has_cp = resume && load_checkpoint(plot_path, cp);
-    if (has_cp) log_info("Resuming from stage " + cp.stage + ", scoop " + std::to_string(cp.scoop));
-    else clear_checkpoint(plot_path);
 
     int workers = std::max(1, (int)std::thread::hardware_concurrency() - 1);
     if (const char* tn = getenv("THREAD_NUMBER")) { int v = atoi(tn); if (v > 0) workers = v; }
@@ -1295,78 +1383,92 @@ static PlotResult create_plot_file(const std::string& plot_path, const std::stri
 
     std::string leaf_path = plot_path + ".tmp.leaf";
     std::string merkle_all = plot_path + ".tmp.merkle_all";
+    std::string staging_path = plot_path + ".tmp.plot";
+    PlotTempCleanup temp_cleanup;
+    temp_cleanup.paths = {leaf_path, merkle_all, staging_path};
     std::string root = ZERO_HASH;
     double t0 = mono_sec();
     double t1 = t0, t2 = t0;
 
-    std::string start_stage = has_cp ? cp.stage : "";
-    if (start_stage.empty() || start_stage == "HASH") {
+    {
         log_info("  [HASH] Computing SHA-256 leaf hashes (parallel)...");
-        long long leaf_count = (start_stage == "HASH") ? cp.scoop : 0;
-        const char* mode = leaf_count > 0 ? "r+b" : "wb";
-        FILE* lf = fopen(leaf_path.c_str(), mode);
-        if (!lf) lf = fopen(leaf_path.c_str(), "wb");
+        long long leaf_count = 0;
+        FILE* lf = fopen(leaf_path.c_str(), "wb");
         if (!lf) { log_error("Cannot open leaf file"); return res; }
-        fseek64(lf, 0, SEEK_END);
-        const long long BATCH = 500000;
+        const long long BATCH = (500000 / SCOOPS_PER_NONCE) * SCOOPS_PER_NONCE;
         int last_log = 0;
         while (leaf_count < total_scoops) {
             long long batch = std::min(BATCH, total_scoops - leaf_count);
             std::vector<std::vector<uint8_t>> parts(workers);
-            long long chunk_size = std::max(1LL, batch / workers);
             std::atomic<int> wi{0};
             auto work = [&]() {
                 while (true) {
                     int ci = wi.fetch_add(1);
                     if (ci >= workers) break;
-                    long long offset = ci * chunk_size;
-                    long long cs = (ci < workers - 1) ? chunk_size : batch - offset;
-                    if (cs <= 0) { parts[ci].clear(); continue; }
+                    const long long nonce_count = batch / SCOOPS_PER_NONCE;
+                    const long long nonces_per_chunk = std::max(1LL, (nonce_count + workers - 1) / workers);
+                    const long long nonce_offset = ci * nonces_per_chunk;
+                    const long long chunk_nonces = std::min(nonces_per_chunk, nonce_count - nonce_offset);
+                    if (chunk_nonces <= 0) { parts[ci].clear(); continue; }
+                    const long long offset = nonce_offset * SCOOPS_PER_NONCE;
+                    const long long cs = chunk_nonces * SCOOPS_PER_NONCE;
                     parts[ci].resize(cs * 32);
-                    long long i = 0;
-                    while (i < cs) {
-                        long long scoop_idx = leaf_count + offset + i;
-                        uint32_t nonce = (uint32_t)(first_nonce + scoop_idx / SCOOPS_PER_NONCE);
-                        int off_in = (int)(scoop_idx % SCOOPS_PER_NONCE);
-                        long long take = std::min((long long)(SCOOPS_PER_NONCE - off_in), cs - i);
-                        std::vector<uint8_t> seed(acct);
-                        uint8_t nb[4] = {(uint8_t)nonce,(uint8_t)(nonce>>8),(uint8_t)(nonce>>16),(uint8_t)(nonce>>24)};
-                        seed.insert(seed.end(), nb, nb + 4);
-                        uint8_t base[32];
-                        sha256(seed.data(), seed.size(), base);
-                        std::vector<uint8_t> buf(36);
-                        memcpy(buf.data(), base, 32);
-                        for (long long j = 0; j < take; j++) {
-                            uint32_t idx = (uint32_t)(off_in + j);
-                            buf[32]=(uint8_t)idx; buf[33]=(uint8_t)(idx>>8); buf[34]=(uint8_t)(idx>>16); buf[35]=(uint8_t)(idx>>24);
-                            sha256(buf.data(), 36, parts[ci].data() + (size_t)(i + j) * 32);
+                    uint64_t cached_nonce = UINT64_MAX;
+                    uint8_t nonce_seed[32];
+                    uint8_t previous_leaf[32];
+                    uint32_t next_slot = 0;
+                    for (long long i = 0; i < cs; ++i) {
+                        const uint64_t index = (uint64_t)(leaf_count + offset + i);
+                        const uint64_t nonce = index / SCOOPS_PER_NONCE;
+                        if (nonce != cached_nonce) {
+                            if (!canonical_seed(chain_id, miner_address, plot_id, nonce, nonce_seed)) {
+                                parts[ci].clear();
+                                break;
+                            }
+                            const uint16_t slot = (uint16_t)(index % SCOOPS_PER_NONCE);
+                            canonical_leaf_for_slot(nonce_seed, slot, previous_leaf);
+                            cached_nonce = nonce;
+                            next_slot = (uint32_t)slot + 1;
+                        } else {
+                            uint8_t next[32];
+                            canonical_leaf_next(nonce_seed, (uint16_t)next_slot, previous_leaf, next);
+                            memcpy(previous_leaf, next, sizeof(next));
+                            ++next_slot;
                         }
-                        i += take;
+                        memcpy(parts[ci].data() + (size_t)i * 32, previous_leaf, sizeof(previous_leaf));
                     }
                 }
             };
             std::vector<std::thread> ths;
             for (int i = 0; i < workers; i++) ths.emplace_back(work);
             for (auto& t : ths) t.join();
-            for (int ci = 0; ci < workers; ci++)
-                if (!parts[ci].empty()) fwrite(parts[ci].data(), 1, parts[ci].size(), lf);
+            bool write_ok = true;
+            size_t batch_written = 0;
+            for (int ci = 0; ci < workers; ci++) {
+                if (!parts[ci].empty()) {
+                    const size_t n = fwrite(parts[ci].data(), 1, parts[ci].size(), lf);
+                    batch_written += n;
+                    if (n != parts[ci].size()) write_ok = false;
+                }
+            }
+            if (batch_written != (size_t)batch * SCOOP_SIZE) write_ok = false;
+            if (!write_ok) { fclose(lf); log_error("Short write while creating v4 leaves"); return res; }
             leaf_count += batch;
             int pct = (int)(leaf_count * 100 / total_scoops);
             if (progress && pct >= last_log + 1) {
                 last_log = pct;
                 log_progress("HASH", leaf_count, total_scoops);
             }
-            if (leaf_count % (total_scoops / 20 + 1) < batch)
-                save_checkpoint(plot_path, "HASH", leaf_count, 0);
         }
-        fclose(lf);
+        const bool leaves_flushed = fflush(lf) == 0 && !ferror(lf);
+        const int leaves_close_result = fclose(lf);
+        if (!leaves_flushed || leaves_close_result != 0) {
+            log_error("Failed to flush complete v4 leaf file");
+            return res;
+        }
         t1 = mono_sec();
         char b[64]; snprintf(b, sizeof b, "  [HASH] 100%% done (%.1fs)", t1 - t0);
         log_info(b);
-        clear_checkpoint(plot_path);
-    } else {
-        if (!file_exists(leaf_path)) { log_error("Resume required but leaf file missing"); return res; }
-        t1 = mono_sec();
     }
 
     long long current_count = total_scoops;
@@ -1375,161 +1477,114 @@ static PlotResult create_plot_file(const std::string& plot_path, const std::stri
     int est_levels = 1;
     while ((1LL << (est_levels - 1)) < current_count) est_levels++;
     {
-        bool append = (start_stage == "MERK") && file_exists(merkle_all);
-        FILE* mf = fopen(merkle_all.c_str(), append ? "ab" : "wb");
+        FILE* mf = fopen(merkle_all.c_str(), "wb");
         if (!mf) { log_error("Cannot open merkle file"); return res; }
         int last_log = 0;
         while (current_count > 1) {
-            if (start_stage == "MERK" && level < cp.level) {
-                std::string out_path = plot_path + ".tmp.merk" + std::to_string(level);
-                if (file_exists(out_path)) input_path = out_path;
-                else { log_error("Missing merkle file " + out_path); fclose(mf); return res; }
-                current_count = (current_count + 1) / 2;
-                level++;
-                continue;
-            }
             std::string out_path = plot_path + ".tmp.merk" + std::to_string(level);
-            cp_merkle_parallel_pass(input_path, out_path, current_count, workers);
+            temp_cleanup.paths.push_back(out_path);
+            if (!cp_merkle_parallel_pass(input_path, out_path, current_count, workers)) {
+                fclose(mf);
+                log_error("Failed to compute v4 Merkle level from complete input leaves");
+                return res;
+            }
             if (input_path != leaf_path) unlink(input_path.c_str());
             input_path = out_path;
             FILE* rf = fopen(out_path.c_str(), "rb");
-            if (rf) {
-                std::vector<uint8_t> buf(4 * 1024 * 1024);
-                size_t n;
-                while ((n = fread(buf.data(), 1, buf.size(), rf)) > 0) fwrite(buf.data(), 1, n, mf);
-                fclose(rf);
+            if (!rf) { fclose(mf); log_error("Could not read completed v4 Merkle level"); return res; }
+            std::vector<uint8_t> buf(4 * 1024 * 1024);
+            size_t n;
+            bool level_ok = true;
+            while ((n = fread(buf.data(), 1, buf.size(), rf)) > 0) {
+                if (fwrite(buf.data(), 1, n, mf) != n) { level_ok = false; break; }
             }
+            if (ferror(rf)) level_ok = false;
+            fclose(rf);
+            if (!level_ok) { fclose(mf); log_error("Short read/write while assembling v4 Merkle levels"); return res; }
             current_count = (current_count + 1) / 2;
             level++;
             int pct = std::min(99, level * 100 / est_levels);
             if (progress && pct >= last_log + 1) { last_log = pct; log_progress("MERK", level, est_levels); }
-            save_checkpoint(plot_path, "MERK", total_scoops, level);
         }
-        fclose(mf);
+        const bool merkle_flushed = fflush(mf) == 0 && !ferror(mf);
+        const int merkle_close_result = fclose(mf);
+        if (!merkle_flushed || merkle_close_result != 0) {
+            log_error("Failed to flush complete v4 Merkle levels");
+            return res;
+        }
         FILE* rf = fopen(input_path.c_str(), "rb");
-        if (rf) {
-            uint8_t rd[32];
-            if (fread(rd, 1, 32, rf) == 32) root = hex_encode(rd, 32);
-            fclose(rf);
-        }
-        unlink(leaf_path.c_str());
+        if (!rf) { log_error("Could not read v4 Merkle root"); return res; }
+        uint8_t rd[32];
+        const bool root_ok = fread(rd, 1, sizeof(rd), rf) == sizeof(rd) && !ferror(rf);
+        fclose(rf);
+        if (!root_ok) { log_error("Short read of v4 Merkle root"); return res; }
+        root = hex_encode(rd, 32);
+        if (root == ZERO_HASH) { log_error("Invalid all-zero v4 Merkle root"); return res; }
         unlink(input_path.c_str());
         t2 = mono_sec();
         char b[128]; snprintf(b, sizeof b, "  [MERK] 100%% done (%.1fs) root=%s...", t2 - t1, root.substr(0,32).c_str());
         log_info(b);
-        clear_checkpoint(plot_path);
     }
 
-    log_info("  [WRIT] Writing V3 plot file...");
-    uint32_t id_high = 0, id_low = 0;
-    sscanf(plot_id.substr(0, 8).c_str(), "%x", &id_high);
-    if (plot_id.size() >= 16) sscanf(plot_id.substr(8, 8).c_str(), "%x", &id_low);
-    bool append = (start_stage == "WRIT") && file_exists(plot_path);
-    FILE* f = fopen(plot_path.c_str(), append ? "r+b" : "wb");
-    if (!f) { log_error("Cannot open plot file"); return res; }
-    long long written = 0;
-    if (!append) {
-        uint8_t header[HEADER_SIZE] = {0};
-        memcpy(header, "CHOCOHUB", 8);
-        *(uint32_t*)(header + 8) = PLOT_FORMAT_V3;
-        *(uint32_t*)(header + 12) = id_high;
-        *(uint32_t*)(header + 16) = id_low;
-        std::string mp = miner_address;
-        mp.resize(44, '\0');
-        memcpy(header + 20, mp.data(), std::min((size_t)44, miner_address.size()));
-        *(uint32_t*)(header + 64) = (uint32_t)total_scoops;
-        *(uint32_t*)(header + 68) = SCOOP_SIZE;
-        std::vector<uint8_t> rh;
-        hex_decode(root, rh);
-        if (rh.size() == 32) memcpy(header + 72, rh.data(), 32);
-        memcpy(header + 104, acct.data(), 32);
-        *(uint64_t*)(header + 136) = first_nonce;
-        fwrite(header, 1, HEADER_SIZE, f);
-    } else {
-        long long esz = file_size(plot_path);
-        written = std::max(0LL, (esz - HEADER_SIZE) / SCOOP_SIZE);
-        fseek64(f, 0, SEEK_END);
+    log_info("  [WRIT] Writing canonical v4 plot file...");
+    std::vector<uint8_t> root_bytes;
+    if (!hex_decode(root, root_bytes) || root_bytes.size() != 32) {
+        log_error("Invalid v4 Merkle root");
+        return res;
     }
-    double writ_start = mono_sec();
-    double total_bytes = (double)total_scoops * SCOOP_SIZE;
-    long long num_nonces = (total_scoops + SCOOPS_PER_NONCE - 1) / SCOOPS_PER_NONCE;
-    long long n = written / SCOOPS_PER_NONCE;
-    const int WT_BATCH = 4000;
-    int last_log = 0;
-    while (n < num_nonces) {
-        long long bn = std::min((long long)WT_BATCH, num_nonces - n);
-        int ntasks = workers;
-        long long chunk_size = std::max(1LL, (bn + ntasks - 1) / ntasks);
-        std::vector<std::vector<uint8_t>> parts(ntasks);
-        std::atomic<int> wi{0};
-        long long base_nonce = n;
-        auto work = [&]() {
-            while (true) {
-                int ci = wi.fetch_add(1);
-                if (ci >= ntasks) break;
-                long long st = base_nonce + ci * chunk_size;
-                long long en = std::min(st + chunk_size, base_nonce + bn);
-                if (st >= en) { parts[ci].clear(); continue; }
-                for (long long nn = st; nn < en; nn++) {
-                    long long ns = std::min((long long)SCOOPS_PER_NONCE, total_scoops - nn * SCOOPS_PER_NONCE);
-                    if (ns <= 0) break;
-                    size_t off = parts[ci].size();
-                    parts[ci].resize(off + ns * 32);
-                    generate_v3_scoops(acct.data(), (uint32_t)(first_nonce + nn), (uint32_t)ns, parts[ci].data() + off);
-                }
-            }
-        };
-        std::vector<std::thread> ths;
-        for (int i = 0; i < ntasks; i++) ths.emplace_back(work);
-        for (auto& t : ths) t.join();
-        long long batch_scoops = 0;
-        for (long long nn = n; nn < n + bn; nn++)
-            batch_scoops += std::min((long long)SCOOPS_PER_NONCE, total_scoops - nn * SCOOPS_PER_NONCE);
-        for (auto& p : parts)
-            if (!p.empty()) fwrite(p.data(), 1, p.size(), f);
-        written += batch_scoops;
-        n += bn;
-        int pct = (int)(written * 100 / (total_scoops + 1));
-        if (progress && pct >= last_log + 1) {
-            last_log = pct;
-            log_progress("WRIT", written, total_scoops, mono_sec() - writ_start, total_bytes);
+    uint8_t header[HEADER_SIZE] = {0};
+    memcpy(header, "CCPOC4PL", 8);
+    put_le32(header + 8, PLOT_FORMAT_V4);
+    put_le32(header + 12, SCOOP_SIZE);
+    put_le64(header + 16, (uint64_t)total_scoops);
+    memcpy(header + 32, plot_id_bytes.data(), 32);
+    memcpy(header + 64, address.data(), 20);
+    memcpy(header + 84, root_bytes.data(), 32);
+    header[116] = (uint8_t)chain_id.size();
+    memcpy(header + 120, chain_id.data(), chain_id.size());
+    FILE* f = fopen(staging_path.c_str(), "wb");
+    if (!f) { log_error("Cannot create v4 plot file"); return res; }
+    bool write_ok = fwrite(header, 1, sizeof(header), f) == sizeof(header);
+    const std::string parts_to_append[] = {leaf_path, merkle_all};
+    std::vector<uint8_t> copy_buf(4 * 1024 * 1024);
+    for (const auto& part : parts_to_append) {
+        FILE* src = fopen(part.c_str(), "rb");
+        if (!src) { write_ok = false; break; }
+        size_t nread;
+        while ((nread = fread(copy_buf.data(), 1, copy_buf.size(), src)) > 0) {
+            if (fwrite(copy_buf.data(), 1, nread, f) != nread) { write_ok = false; break; }
         }
-        save_checkpoint(plot_path, "WRIT", written, 0);
+        if (ferror(src)) write_ok = false;
+        fclose(src);
+        if (!write_ok) break;
     }
-    {
-        FILE* mf = fopen(merkle_all.c_str(), "rb");
-        if (mf) {
-            std::vector<uint8_t> buf(1024 * 1024);
-            size_t r;
-            while ((r = fread(buf.data(), 1, buf.size(), mf)) > 0) fwrite(buf.data(), 1, r, f);
-            fclose(mf);
-        }
-    }
-    fclose(f);
+    if (fflush(f) != 0 || ferror(f)) write_ok = false;
+    if (fclose(f) != 0) write_ok = false;
+    unlink(leaf_path.c_str());
     unlink(merkle_all.c_str());
-    clear_checkpoint(plot_path);
+    for (int l = 0; l < level; ++l) unlink((plot_path + ".tmp.merk" + std::to_string(l)).c_str());
+    if (!write_ok) { log_error("Failed writing complete v4 plot file"); return res; }
     {
         char b[64]; snprintf(b, sizeof b, "  [WRIT] 100%% done (%.1fs)", mono_sec() - t2);
         log_info(b);
     }
 
-    long long fsize = file_size(plot_path);
+    long long fsize = file_size(staging_path);
     if (fsize != plot_size) {
         log_error("File size mismatch: " + std::to_string(fsize) + " vs " + std::to_string(plot_size));
         return res;
     }
     {
-        FILE* vf = fopen(plot_path.c_str(), "rb");
-        if (vf) {
-            uint8_t sr[32];
-            fseek64(vf, 72, SEEK_SET);
-            if (fread(sr, 1, 32, vf) == 32 && hex_encode(sr, 32) != root) {
-                fclose(vf);
-                log_error("Root mismatch in written plot");
-                return res;
-            }
-            fclose(vf);
-        }
+        FILE* vf = fopen(staging_path.c_str(), "rb");
+        if (!vf) { log_error("Could not reread completed v4 plot"); return res; }
+        uint8_t sr[32];
+        const bool header_ok = fseek64(vf, 84, SEEK_SET) == 0 && fread(sr, 1, sizeof(sr), vf) == sizeof(sr);
+        fclose(vf);
+        if (!header_ok || hex_encode(sr, 32) != root) { log_error("Root mismatch in written plot"); return res; }
+    }
+    if (file_exists(plot_path) || rename(staging_path.c_str(), plot_path.c_str()) != 0) {
+        log_error("Could not atomically publish v4 plot without overwriting an existing file");
+        return res;
     }
     char b[160];
     snprintf(b, sizeof b, "Plot created: %s (%.3f GB, root=%s...)", plot_path.c_str(), fsize/1e9, root.substr(0,32).c_str());
@@ -1538,52 +1593,9 @@ static PlotResult create_plot_file(const std::string& plot_path, const std::stri
     res.size_gb = size_gb;
     res.total_scoops = total_scoops;
     res.merkle_root = root;
-    res.account_id = acct_hex;
     res.path = plot_path;
     res.ok = true;
     return res;
-}
-
-static bool register_plot(const std::vector<std::string>& seeds, const std::string& miner,
-                          const std::string& plot_id, double size_gb, const std::string& merkle_root,
-                          long long total_scoops, bool verify_ssl, MinerKey* key) {
-    Json payload = Json::object();
-    payload.obj["plot_id"] = Json::s(plot_id);
-    payload.obj["miner"] = Json::s(miner);
-    payload.obj["merkle_root"] = Json::s(merkle_root);
-    payload.obj["size_gb"] = Json::n(size_gb);
-    payload.obj["total_scoops"] = Json::i(total_scoops);
-    for (auto& url : seeds) {
-        if (key) {
-            std::vector<uint8_t> pubb;
-            hex_decode(pub_compressed_hex(key), pubb);
-            char gb[32]; snprintf(gb, sizeof gb, "%.10g", size_gb);
-            std::string msg = plot_register_message(miner, plot_id, merkle_root, gb, total_scoops);
-            Json sp = payload;
-            sp.obj["size_gb"] = Json::s(gb);
-            sp.obj["total_scoops"] = Json::i(total_scoops);
-            sp.obj["public_key"] = Json::s(base64_encode(pubb.data(), pubb.size()));
-            sp.obj["signature"] = Json::s(sign_proof_message(msg, key));
-            Json resp;
-            if (http_post(url + "/api/poc/register_plot_public", sp, resp, verify_ssl, true)) {
-                if (auto* ok = resp.get("ok"); ok && ok->truthy()) {
-                    log_info("Registered plot " + plot_id.substr(0,16) + "... on " + url);
-                    return true;
-                }
-            } else {
-                log_info(url + " has no public register endpoint; using legacy registration");
-            }
-        }
-        Json resp;
-        if (http_post(url + "/api/poc/register_plot", payload, resp, verify_ssl)) {
-            if (auto* ok = resp.get("ok"); ok && ok->truthy()) {
-                log_info("Registered plot " + plot_id.substr(0,16) + "... on " + url);
-                return true;
-            }
-            log_warn("Register failed on " + url + ": " + resp.dump());
-        }
-    }
-    return false;
 }
 
 static std::vector<std::vector<uint8_t>> read_merkle_proof(const std::string& path, long long total_scoops,
@@ -1598,10 +1610,10 @@ static std::vector<std::vector<uint8_t>> read_merkle_proof(const std::string& pa
         if (sibling < count) {
             std::vector<uint8_t> node(count == total_scoops ? scoop_size : 32);
             if (count == total_scoops) {
-                fseek64(f, HEADER_SIZE + sibling * scoop_size, SEEK_SET);
+                if (fseek64(f, HEADER_SIZE + sibling * scoop_size, SEEK_SET) != 0) { fclose(f); return {}; }
                 if (fread(node.data(), 1, node.size(), f) != node.size()) node.clear();
             } else {
-                fseek64(f, tree_start + (tree_offset + sibling) * 32, SEEK_SET);
+                if (fseek64(f, tree_start + (tree_offset + sibling) * 32, SEEK_SET) != 0) { fclose(f); return {}; }
                 if (fread(node.data(), 1, 32, f) != 32) node.clear();
             }
             if (!node.empty()) proof.push_back(std::move(node));
@@ -1613,6 +1625,16 @@ static std::vector<std::vector<uint8_t>> read_merkle_proof(const std::string& pa
     }
     fclose(f);
     return proof;
+}
+
+static size_t expected_merkle_proof_length(uint64_t leaf_count, uint64_t index) {
+    size_t length = 0;
+    while (leaf_count > 1) {
+        if ((index ^ 1) < leaf_count) ++length;
+        index >>= 1;
+        leaf_count = (leaf_count + 1) / 2;
+    }
+    return length;
 }
 
 static std::mutex g_scan_mu;
@@ -1696,23 +1718,27 @@ struct Proof {
     std::string proof_digest;
     std::string scoop_data_hex;
     std::vector<std::string> merkle_proof_hex;
+    struct Sample { uint64_t index; std::string leaf; std::vector<std::string> proof; };
+    std::vector<Sample> capacity_samples;
     bool valid = false;
 };
 
 static Proof build_poc_proof(const std::string& plot_path, const Json& challenge,
+                             const std::string& expected_miner, const std::string& expected_chain_id,
                              const std::vector<uint8_t>& sig, long long bt, long long max_dl = 86400,
                              long long stop_deadline = -1, std::atomic<bool>* stop_event = nullptr) {
     Proof pr;
     PlotMeta meta = get_plot_meta(plot_path);
-    if (!meta.valid) return pr;
+    if (!meta.valid || meta.miner != str_tolower(expected_miner)) return pr;
     long long total_scoops = meta.total_scoops;
-    int scoop_size = meta.scoop_size;
-    long long plot_data_bytes = total_scoops * scoop_size;
+    if (meta.chain_id != expected_chain_id) return pr;
     std::string gen_sig;
     if (auto* g = challenge.get("challenge_seed")) gen_sig = g->as_str();
     else if (auto* g = challenge.get("generation_signature")) gen_sig = g->as_str();
-    uint32_t hv = (uint32_t)strtoul(sha256hex(gen_sig).substr(0, 8).c_str(), nullptr, 16);
-    int scoop_num = (int)(hv % MINING_SCOOP_MODULUS);
+    std::string challenge_id;
+    if (auto* c = challenge.get("challenge_id")) challenge_id = c->as_str();
+    uint32_t scoop_num = 0;
+    if (gen_sig.empty() || !v4_challenge_slot(challenge_id, scoop_num)) return pr;
 
     long long best_deadline = -1;
     std::vector<uint8_t> best_scoop;
@@ -1720,64 +1746,93 @@ static Proof build_poc_proof(const std::string& plot_path, const Json& challenge
     try {
         FILE* f = fopen(plot_path.c_str(), "rb");
         if (!f) return pr;
-        long long stride_bytes = (long long)MINING_SCOOP_MODULUS * scoop_size;
-        long long strides_per_chunk = std::max(1LL, SCAN_CHUNK_TARGET_BYTES / stride_bytes);
-        long long i = scoop_num;
-        bool hit_stop = false;
-        while (i < total_scoops) {
+        const uint64_t leaf_count = meta.total_scoops;
+        for (uint64_t idx = scoop_num; idx < leaf_count; idx += SCOOPS_PER_NONCE) {
             if (stop_event && stop_event->load()) break;
-            long long file_offset = HEADER_SIZE + i * scoop_size;
-            long long read_len = std::min(strides_per_chunk * stride_bytes, (total_scoops - i) * scoop_size);
-            read_len = std::max(read_len, (long long)scoop_size);
-            std::vector<uint8_t> raw(read_len);
-            fseek64(f, file_offset, SEEK_SET);
-            size_t got = fread(raw.data(), 1, read_len, f);
-            if (got == 0) break;
-            raw.resize(got);
-            posix_fadvise(fileno(f), file_offset, got, POSIX_FADV_SEQUENTIAL);
-            long long idx = i;
-            long long local = 0;
-            while (local + scoop_size <= (long long)raw.size() && idx < total_scoops) {
-                const uint8_t* buf = raw.data() + local;
-                pr.bytes_read += scoop_size;
-                long long dl = compute_deadline(buf, scoop_size, sig, bt, max_dl);
-                if (best_deadline < 0 || dl < best_deadline) {
-                    best_deadline = dl;
-                    best_scoop.assign(buf, buf + scoop_size);
-                    best_idx = idx;
-                }
-                if (stop_deadline > 0 && best_deadline > 0 && best_deadline <= stop_deadline) {
-                    hit_stop = true;
-                    if (stop_event) stop_event->store(true);
-                    break;
-                }
-                local += stride_bytes;
-                idx += MINING_SCOOP_MODULUS;
+            std::array<uint8_t, SCOOP_SIZE> leaf{};
+            const uint64_t offset = HEADER_SIZE + idx * SCOOP_SIZE;
+            if (fseek64(f, (long long)offset, SEEK_SET) != 0 || fread(leaf.data(), 1, leaf.size(), f) != leaf.size()) {
+                fclose(f);
+                log_error("Short or failed v4 target-leaf read from " + plot_path);
+                return pr;
             }
-            long long covered = std::min(plot_data_bytes, idx * (long long)scoop_size);
-            scan_set(plot_path, covered, plot_data_bytes, best_deadline);
-            if (hit_stop) break;
-            i += strides_per_chunk * MINING_SCOOP_MODULUS;
+            pr.bytes_read += leaf.size();
+            const long long dl = compute_deadline(leaf.data(), leaf.size(), sig, bt);
+            if (best_deadline < 0 || dl < best_deadline) {
+                best_deadline = dl;
+                best_scoop.assign(leaf.begin(), leaf.end());
+                best_idx = (long long)idx;
+            }
+            scan_set(plot_path, (long long)(idx + SCOOPS_PER_NONCE), (long long)leaf_count, best_deadline);
+            if (stop_deadline > 0 && best_deadline <= stop_deadline) {
+                if (stop_event) stop_event->store(true);
+                break;
+            }
         }
         fclose(f);
         scan_clear(plot_path);
         if (best_deadline <= 0) { pr.deadline = 0; pr.total_scoops = total_scoops; return pr; }
-        auto proof_nodes = read_merkle_proof(plot_path, total_scoops, best_idx, scoop_size);
+        if (best_deadline > max_dl) { pr.total_scoops = total_scoops; return pr; }
+        uint8_t expected_target[32];
+        if (!canonical_leaf(meta.chain_id, meta.miner, meta.plot_id, (uint64_t)best_idx, expected_target) ||
+            memcmp(expected_target, best_scoop.data(), sizeof(expected_target)) != 0) {
+            log_error("Stored v4 target leaf is not canonical");
+            return pr;
+        }
+        auto proof_nodes = read_merkle_proof(plot_path, total_scoops, best_idx, SCOOP_SIZE);
+        if (proof_nodes.size() != expected_merkle_proof_length(leaf_count, (uint64_t)best_idx)) {
+            log_error("Incomplete v4 target Merkle path"); return pr;
+        }
         for (auto& nd : proof_nodes) pr.bytes_read += (long long)nd.size();
-        Sha256 c;
-        c.update(best_scoop.data(), best_scoop.size());
-        std::string dls = std::to_string(best_deadline);
-        c.update((const uint8_t*)dls.data(), dls.size());
-        uint8_t dg[32];
-        c.final(dg);
-        pr.proof_digest = hex_encode(dg, 32);
+        Sha256 digest_ctx;
+        digest_ctx.update(best_scoop.data(), best_scoop.size());
+        const std::string deadline_text = std::to_string(best_deadline);
+        digest_ctx.update((const uint8_t*)deadline_text.data(), deadline_text.size());
+        uint8_t digest_bytes[32]; digest_ctx.final(digest_bytes);
+        pr.proof_digest = hex_encode(digest_bytes, 32);
         pr.scoop_data_hex = hex_encode(best_scoop.data(), best_scoop.size());
         for (auto& nd : proof_nodes) pr.merkle_proof_hex.push_back(hex_encode(nd.data(), nd.size()));
         pr.scoop_num = scoop_num;
         pr.deadline = best_deadline;
         pr.scoop_index = best_idx;
         pr.total_scoops = total_scoops;
-        pr.read_count = (total_scoops + MINING_SCOOP_MODULUS - 1) / MINING_SCOOP_MODULUS;
+        pr.read_count = (total_scoops + SCOOPS_PER_NONCE - 1) / SCOOPS_PER_NONCE;
+
+        std::vector<uint64_t> sample_indexes;
+        if (!v4_sample_indexes(challenge_id, leaf_count, meta.plot_id, sample_indexes, (uint64_t)best_idx)) {
+            log_error("Could not derive canonical v4 capacity samples");
+            return Proof{};
+        }
+        FILE* sf = fopen(plot_path.c_str(), "rb");
+        if (!sf) return Proof{};
+        for (uint64_t sample_index : sample_indexes) {
+            std::array<uint8_t, SCOOP_SIZE> sample_leaf{};
+            const uint64_t offset = HEADER_SIZE + sample_index * SCOOP_SIZE;
+            if (fseek64(sf, (long long)offset, SEEK_SET) != 0 || fread(sample_leaf.data(), 1, sample_leaf.size(), sf) != sample_leaf.size()) {
+                fclose(sf);
+                log_error("Short or failed v4 capacity-sample read from " + plot_path);
+                return Proof{};
+            }
+            uint8_t expected_sample[32];
+            if (!canonical_leaf(meta.chain_id, meta.miner, meta.plot_id, sample_index, expected_sample) ||
+                memcmp(expected_sample, sample_leaf.data(), sizeof(expected_sample)) != 0) {
+                fclose(sf); log_error("Stored v4 capacity-sample leaf is not canonical"); return Proof{};
+            }
+            auto sample_path = read_merkle_proof(plot_path, total_scoops, (long long)sample_index, SCOOP_SIZE);
+            if (sample_path.size() != expected_merkle_proof_length(leaf_count, sample_index)) {
+                fclose(sf); log_error("Incomplete v4 capacity-sample Merkle path"); return Proof{};
+            }
+            Proof::Sample sample;
+            sample.index = sample_index;
+            sample.leaf = hex_encode(sample_leaf.data(), sample_leaf.size());
+            for (const auto& node : sample_path) {
+                sample.proof.push_back(hex_encode(node.data(), node.size()));
+                pr.bytes_read += (long long)node.size();
+            }
+            pr.bytes_read += sample_leaf.size();
+            pr.capacity_samples.push_back(std::move(sample));
+        }
+        fclose(sf);
         pr.valid = true;
         return pr;
     } catch (const std::exception& e) {
@@ -1786,7 +1841,8 @@ static Proof build_poc_proof(const std::string& plot_path, const Json& challenge
     }
 }
 
-static void run_mining(const std::string& miner_addr, const std::vector<std::string>& seeds,
+static void run_mining(const std::string& miner_addr, const std::string& chain_id,
+                       const std::vector<std::string>& seeds,
                        const std::vector<std::string>& plot_files, MinerKey* key, bool verify_ssl,
                        int interval, int max_workers, long long stop_deadline, const std::string& pool_url) {
     long long scans = 0, accepted = 0, total_bytes_read = 0;
@@ -1799,22 +1855,14 @@ static void run_mining(const std::string& miner_addr, const std::vector<std::str
     Pending pending;
     long long max_dl_cache = 21600;
 
-    if (key) {
-        int reg_ok = 0;
-        for (auto& p : plot_files) {
-            PlotMeta m = get_plot_meta(p);
-            if (!m.valid) continue;
-            double sgb = m.total_scoops * SCOOP_SIZE / (1024.0*1024*1024);
-            if (register_plot(seeds, miner_addr, m.plot_id, sgb, m.merkle_root, m.total_scoops, verify_ssl, key))
-                reg_ok++;
-        }
-        log_info("Plot registration: " + std::to_string(reg_ok) + "/" + std::to_string(plot_files.size()) + " plots registered");
+    if (!key) {
+        log_error("v4 proof submission requires a wallet private key");
+        return;
     }
-    log_info("Starting mining loop...");
+    log_info("Starting v4 mining loop; only mature chain-registered plots will be scanned...");
 
     auto submit_payload_to = [&](const std::string& base, const Json& payload, const std::string& ch_id,
-                                 long long height, const std::string& best_plot, bool is_pool,
-                                 const std::string& active_seed) -> bool {
+                                 long long height) -> bool {
         Json resp;
         try {
             if (http_post(base + "/api/mining/submit-proof", payload, resp, verify_ssl) && resp.get("ok") && resp.get("ok")->truthy()) {
@@ -1852,31 +1900,7 @@ static void run_mining(const std::string& miner_addr, const std::vector<std::str
                 }
                 return true;
             }
-            std::string err;
-            if (auto* e = resp.get("error")) err = e->as_str();
             log_warn("Submit rejected by " + base + ": " + resp.dump());
-            if (err.find("merkle_root commitment") != std::string::npos && key && !best_plot.empty()) {
-                log_info("Commitment missing on node - re-registering plot and retrying once...");
-                PlotMeta m2 = get_plot_meta(best_plot);
-                if (m2.valid) {
-                    double sgb = m2.total_scoops * SCOOP_SIZE / (1024.0*1024*1024);
-                    register_plot({active_seed.empty() ? base : active_seed}, miner_addr, m2.plot_id, sgb,
-                                  m2.merkle_root, m2.total_scoops, verify_ssl, key);
-                }
-                Json resp2;
-                if (http_post(base + "/api/mining/submit-proof", payload, resp2, verify_ssl) &&
-                    resp2.get("ok") && resp2.get("ok")->truthy()) {
-                    accepted++;
-                    submitted_challenges.insert(ch_id);
-                    submitted_order.push_back(ch_id);
-                    if (submitted_order.size() > MAX_SUBMITTED) {
-                        submitted_challenges.erase(submitted_order.front());
-                        submitted_order.pop_front();
-                    }
-                    log_info(">>> Proof accepted after re-register (total: " + std::to_string(accepted) + ")");
-                    return true;
-                }
-            }
         } catch (const std::exception& e) {
             log_error("Submit error on " + base + ": " + e.what());
         }
@@ -1960,26 +1984,53 @@ static void run_mining(const std::string& miner_addr, const std::vector<std::str
                     }
                 }
             }
+            std::map<std::string, std::string> registered_roots;
+            if (!fetch_mature_plot_roots(active_seed, miner_addr, verify_ssl, registered_roots)) {
+                log_warn("Could not fetch this node's mature on-chain plot registrations");
+                sleep(interval);
+                continue;
+            }
+            std::vector<std::string> mineable_plots;
+            for (const auto& path : plot_files) {
+                PlotMeta meta = get_plot_meta(path);
+                auto registered = registered_roots.find(meta.plot_id);
+                if (meta.valid && meta.chain_id == chain_id && meta.miner == miner_addr &&
+                    registered != registered_roots.end() && registered->second == meta.merkle_root) {
+                    mineable_plots.push_back(path);
+                }
+            }
+            if (mineable_plots.empty()) {
+                log_warn("No mature registered v4 plot matches this miner, chain_id, plot ID, and root; add the commitment to genesis or register it on-chain");
+                sleep(interval);
+                continue;
+            }
             std::atomic<bool> scan_stop{false};
-            std::vector<std::future<Proof>> futs;
-            for (auto& p : plot_files) {
-                futs.push_back(std::async(std::launch::async, [&, p]() {
-                    return build_poc_proof(p, challenge, sig, bt, max_dl, stop_deadline, &scan_stop);
-                }));
+            std::vector<Proof> proof_results(mineable_plots.size());
+            std::atomic<size_t> next_plot{0};
+            const int scan_workers = std::max(1, std::min(max_workers, (int)mineable_plots.size()));
+            std::vector<std::thread> scan_threads;
+            for (int worker = 0; worker < scan_workers; ++worker) {
+                scan_threads.emplace_back([&]() {
+                    for (;;) {
+                        const size_t index = next_plot.fetch_add(1);
+                        if (index >= mineable_plots.size()) break;
+                        proof_results[index] = build_poc_proof(mineable_plots[index], challenge,
+                            miner_addr, chain_id, sig, bt, max_dl, stop_deadline, &scan_stop);
+                    }
+                });
             }
             Reporter rep;
             rep.start();
+            for (auto& thread : scan_threads) thread.join();
             Proof best;
             std::string best_plot;
-            for (size_t i = 0; i < futs.size(); i++) {
+            for (size_t i = 0; i < proof_results.size(); i++) {
                 scans++;
-                Proof p;
-                try { p = futs[i].get(); }
-                catch (const std::exception& e) { log_error(std::string("Scan error: ") + e.what()); continue; }
+                Proof p = std::move(proof_results[i]);
                 total_bytes_read += p.bytes_read;
                 if (p.valid && (!best.valid || p.deadline < best.deadline)) {
                     best = std::move(p);
-                    best_plot = plot_files[i];
+                    best_plot = mineable_plots[i];
                 }
             }
             rep.finish();
@@ -2017,6 +2068,21 @@ static void run_mining(const std::string& miner_addr, const std::vector<std::str
             pp.obj["merkle_proof"] = mp;
             pp.obj["scoop_index"] = Json::i(best.scoop_index);
             pp.obj["total_scoops"] = Json::i(best.total_scoops);
+            pp.obj["merkle_root"] = Json::s(meta.merkle_root);
+            pp.obj["challenge_seed"] = Json::s(gen_sig);
+            pp.obj["base_target"] = Json::s(std::to_string(bt));
+            pp.obj["public_key"] = Json::s(key ? pub_compressed_hex(key) : "");
+            Json samples = Json::array();
+            for (const auto& sample : best.capacity_samples) {
+                Json item = Json::object();
+                item.obj["index"] = Json::i((long long)sample.index);
+                item.obj["leaf"] = Json::s(sample.leaf);
+                Json path = Json::array();
+                for (const auto& node : sample.proof) path.arr.push_back(Json::s(node));
+                item.obj["merkle_proof"] = std::move(path);
+                samples.arr.push_back(std::move(item));
+            }
+            pp.obj["capacity_samples"] = std::move(samples);
 
             Json payload = Json::object();
             payload.obj["challenge_id"] = Json::s(ch_id);
@@ -2029,10 +2095,10 @@ static void run_mining(const std::string& miner_addr, const std::vector<std::str
 
             bool submitted = false;
             if (!pool_url.empty()) {
-                submitted = submit_payload_to(pool_url, payload, ch_id, height, best_plot, true, "");
+                submitted = submit_payload_to(pool_url, payload, ch_id, height);
             } else {
                 for (auto& s : seeds)
-                    if (submit_payload_to(s, payload, ch_id, height, best_plot, false, active_seed)) { submitted = true; break; }
+                    if (submit_payload_to(s, payload, ch_id, height)) { submitted = true; break; }
             }
             if (!submitted) log_warn("Proof submission failed on all seed nodes");
 
@@ -2068,46 +2134,27 @@ static double to_float(const std::string& s, double d = 0) {
     try {
         std::string t = s;
         std::replace(t.begin(), t.end(), ',', '.');
-        return std::stod(t);
+        size_t used = 0;
+        const double value = std::stod(t, &used);
+        return used == t.size() && std::isfinite(value) ? value : d;
     } catch (...) { return d; }
 }
 
-static std::vector<uint8_t> resolve_account_id() {
-    Wallet w = load_wallet_file(wallet_path());
-    if (w.valid) {
-        if (!w.private_key.empty()) {
-            MinerKey* mk = load_private_key(w.private_key);
-            if (mk) {
-                std::string pub = pub_compressed_hex(mk);
-                delete mk;
-                log_info("Account ID derived from wallet.json private key");
-                return compute_account_id(pub);
-            }
-        }
-        if (!w.public_key.empty()) {
-            log_info("Account ID derived from wallet.json public key");
-            return compute_account_id(w.public_key);
-        }
-    }
-    log_warn("Random account ID (no wallet.json private/public key available)");
-    return {};
-}
-
 static std::vector<PlotResult> create_plots(const std::string& outdir, const std::vector<double>& sizes,
-                                            const std::string& miner_addr, const std::vector<std::string>& seeds,
-                                            bool verify_ssl, bool resume, MinerKey* key) {
+                                            const std::string& miner_addr, const std::string& chain_id) {
     make_dirs(outdir);
-    std::vector<uint8_t> acct = resolve_account_id();
     std::vector<PlotResult> created;
     for (size_t i = 0; i < sizes.size(); i++) {
-        std::string plot_id = random_hex(8);
+        std::string plot_id = random_hex(32);
         std::string path = outdir + "/" + plot_id + ".plot";
         log_info("[" + std::to_string(i+1) + "/" + std::to_string(sizes.size()) + "] Creating " +
-                 std::to_string((int)sizes[i]) + " GB plot " + plot_id + "...");
-        PlotResult r = create_plot_file(path, plot_id, miner_addr, sizes[i], acct, true, resume, (uint64_t)-1);
+                 std::to_string(sizes[i]) + " GiB v4 plot " + plot_id + "...");
+        PlotResult r = create_plot_file(path, plot_id, str_tolower(miner_addr), chain_id, sizes[i], true);
         if (r.ok) {
             created.push_back(r);
-            register_plot(seeds, miner_addr, plot_id, r.size_gb, r.merkle_root, r.total_scoops, verify_ssl, key);
+            log_info("Genesis registration (use this plot only after adding it to the shared v4 genesis config):");
+            printf("{\"miner\":\"%s\",\"plot_id\":\"%s\",\"merkle_root\":\"%s\",\"capacity_bytes\":\"%lld\"}\n",
+                   str_tolower(miner_addr).c_str(), r.plot_id.c_str(), r.merkle_root.c_str(), r.total_scoops * SCOOP_SIZE);
         } else {
             log_error("Failed to create plot " + std::to_string(i+1));
         }
@@ -2152,33 +2199,33 @@ ___  ____       _  ___  ____
 | |  | | | | | | | | |  | | | | | |  __/ |
 \_|  |_/_|_| |_|_| \_|  |_/_|_| |_|\___|_|
 
-The First CCPOC Miner Release (V1.1.0 - C++ edition)!
+CCPoC v4 canonical plot miner!
 )" + RESET;
 }
 
-static const char* CCPOC_VERSION = "1.1.0";
+static const char* CCPOC_VERSION = "4.0.0";
 
 static void print_help(const char* prog) {
     printf("ChocoHub Unified Miner v%s - Plot Generation + PoC Mining (C++)\n\n"
            "Usage:\n"
            "  %s                          # mine (asks for whatever is missing)\n"
-           "  %s generate 1               # generate a 1 GB plot and register it\n"
-           "  %s generate 1 3             # generate two plots: 1 GB and 3 GB\n"
+           "  %s generate 1               # generate a 1 GiB v4 plot\n"
+           "  %s generate 1 3             # generate two plots: 1 GiB and 3 GiB\n"
            "  %s status                   # show wallet, plots and effective capacity\n"
            "  %s --miner 0x... --rpc http://localhost:3000\n"
            "  %s --generate-key\n\n"
            "Options:\n"
            "  --miner ADDR          Wallet address\n"
+           "  --wallet PATH         Wallet JSON path (default: $HOME/wallet.json)\n"
            "  --rpc URL[,URL]       RPC seed URL(s)\n"
+           "  --chain-id ID         v4 chain ID (must match the node; default 19971971)\n"
            "  --pool URL            Pool URL for submitting proofs\n"
-           "  --genplot N           (legacy) generate N plots before mining\n"
-           "  --genplot-size GB     Plot size in GB (default 0.1)\n"
+           "  --genplot N           Generate N v4 plots before mining\n"
+           "  --genplot-size GiB    v4 capacity in GiB (must be a multiple of 256 KiB)\n"
            "  --genplot-outdir DIR  Plot output directory\n"
            "  --plots-dir DIR       Directory with existing plots\n"
            "  --interval S          Mining poll interval (default 20)\n"
            "  --threads N           Scan threads (default 4)\n"
-           "  --no-ssl-verify       Disable SSL verification\n"
-           "  --resume              Resume interrupted plot generation\n"
            "  --generate-key        Generate secp256k1 keypair and exit\n"
            "  --no-mine             Only generate plots\n"
            "  --stop-deadline S     Submit as soon as deadline <= S is found\n"
@@ -2191,11 +2238,12 @@ int main(int argc, char** argv) {
     g_log_fp = fopen("miner.log", "a");
     log_info(make_banner());
 
-    std::string miner_addr, rpc, pool_url, plots_dir, genplot_outdir;
+    std::string miner_addr, rpc, pool_url, plots_dir, genplot_outdir, wallet_file;
+    std::string chain_id = "19971971";
     int genplot = 0;
-    double genplot_size = 0.1;
+    double genplot_size = 1.0;
     int interval = 20, threads = 4;
-    bool verify_ssl = true, resume = false, gen_key = false, no_mine = false;
+    bool verify_ssl = true, gen_key = false, no_mine = false;
     long long stop_deadline = -1;
     std::vector<double> sizes;
     std::string mode = "mine";
@@ -2210,16 +2258,16 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--miner") miner_addr = next();
+        else if (a == "--wallet") wallet_file = next();
         else if (a == "--rpc") rpc = next();
+        else if (a == "--chain-id") chain_id = next();
         else if (a == "--pool") pool_url = next();
         else if (a == "--genplot") genplot = atoi(next().c_str());
-        else if (a == "--genplot-size") genplot_size = to_float(next(), 0.1);
+        else if (a == "--genplot-size") genplot_size = to_float(next(), 1.0);
         else if (a == "--genplot-outdir") genplot_outdir = next();
         else if (a == "--plots-dir") plots_dir = next();
         else if (a == "--interval") interval = atoi(next().c_str());
         else if (a == "--threads") threads = atoi(next().c_str());
-        else if (a == "--no-ssl-verify") verify_ssl = false;
-        else if (a == "--resume") resume = true;
         else if (a == "--generate-key") gen_key = true;
         else if (a == "--no-mine") no_mine = true;
         else if (a == "--stop-deadline") stop_deadline = atoll(next().c_str());
@@ -2228,6 +2276,8 @@ int main(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-') sizes.push_back(to_float(a));
         else { log_error("Unknown argument: " + a); print_help(argv[0]); return 1; }
     }
+
+    if (!wallet_file.empty()) g_wallet_path_override = wallet_file;
 
     if (gen_key) {
         std::string priv, pub;
@@ -2247,6 +2297,12 @@ int main(int argc, char** argv) {
         printf("Public key (base64) -> user registration on the node:\n  %s\n",
                base64_encode(pb.data(), pb.size()).c_str());
         return 0;
+    }
+
+    if (chain_id.empty() || (chain_id.size() > 1 && chain_id[0] == '0') || chain_id.size() > 255 ||
+        !std::all_of(chain_id.begin(), chain_id.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        log_error("--chain-id must be a canonical unsigned decimal value with at most 255 bytes");
+        return 1;
     }
 
     std::vector<std::string> seeds;
@@ -2297,6 +2353,12 @@ int main(int argc, char** argv) {
     }
     if (miner_addr.empty()) {
         log_error("Wallet address required: use --miner, provide wallet.json, or answer the prompt");
+        return 1;
+    }
+    std::vector<uint8_t> miner_bytes;
+    miner_addr = str_tolower(miner_addr);
+    if (!hex_decode(miner_addr, miner_bytes) || miner_bytes.size() != 20 || miner_addr.rfind("0x", 0) != 0) {
+        log_error("Miner address must be a 20-byte 0x-prefixed hex address");
         return 1;
     }
 
@@ -2351,7 +2413,7 @@ int main(int argc, char** argv) {
             if (v > 0) ss.push_back(v);
         }
         std::string outdir = !genplot_outdir.empty() ? genplot_outdir : ask("Plot output directory", default_outdir);
-        auto created = create_plots(outdir, ss, miner_addr, seeds, verify_ssl, resume, key);
+        auto created = create_plots(outdir, ss, miner_addr, chain_id);
         log_info(std::to_string(created.size()) + "/" + std::to_string(ss.size()) + " plot(s) created in " + outdir);
         if (no_mine) { delete key; return 0; }
         std::string a = str_tolower(ask("Start mining now? (Y/n)", "y"));
@@ -2360,7 +2422,7 @@ int main(int argc, char** argv) {
     } else if (genplot > 0) {
         std::string outdir = !genplot_outdir.empty() ? genplot_outdir : plots_dir;
         std::vector<double> ss(genplot, genplot_size);
-        create_plots(outdir, ss, miner_addr, seeds, verify_ssl, resume, key);
+        create_plots(outdir, ss, miner_addr, chain_id);
         if (no_mine) { delete key; return 0; }
         plots_dir = outdir;
     }
@@ -2372,7 +2434,7 @@ int main(int argc, char** argv) {
         std::string raw = ask("Plots directory OR size in GB to generate", "scan");
         double sz = to_float(raw);
         if (sz > 0) {
-            auto created = create_plots(plots_dir, {sz}, miner_addr, seeds, verify_ssl, resume, key);
+            auto created = create_plots(plots_dir, {sz}, miner_addr, chain_id);
             if (created.empty()) continue;
         } else if (!raw.empty() && raw != "scan") {
             plots_dir = raw;
@@ -2397,7 +2459,7 @@ int main(int argc, char** argv) {
     if (g_csv && ftell(g_csv) == 0)
         fprintf(g_csv, "ts,height,deadline,best_deadline,mbps,uptime_s,plots\n");
 
-    run_mining(miner_addr, seeds, plot_files, key, verify_ssl, interval, threads, stop_deadline, pool_url);
+    run_mining(miner_addr, chain_id, seeds, plot_files, key, verify_ssl, interval, threads, stop_deadline, pool_url);
     if (g_csv) fclose(g_csv);
     delete key;
     curl_global_cleanup();
